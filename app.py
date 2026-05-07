@@ -9,8 +9,8 @@ from pathlib import Path
 
 # ────────────── AI引擎 ──────────────
 def extract_json_array(text: str):
-    """尝试从AI返回的文本中提取JSON数组，支持多种格式"""
-    # 1. 直接解析整个文本
+    """从AI返回文本中提取JSON数组"""
+    # 1. 直接解析
     try:
         data = json.loads(text)
         if isinstance(data, list):
@@ -18,7 +18,7 @@ def extract_json_array(text: str):
     except:
         pass
 
-    # 2. 提取代码块中的json
+    # 2. 代码块提取
     match = re.search(r'```json\s*\n?(.*?)\n?```', text, re.DOTALL)
     if match:
         try:
@@ -28,7 +28,7 @@ def extract_json_array(text: str):
         except:
             pass
 
-    # 3. 提取第一个方括号开始到最后一个方括号结束的内容
+    # 3. 提取首尾括号
     start = text.find('[')
     end = text.rfind(']')
     if start != -1 and end != -1 and end > start:
@@ -39,8 +39,44 @@ def extract_json_array(text: str):
         except:
             pass
 
-    # 如果都失败，返回None
     return None
+
+# 字段映射（AI可能使用的各种键名）
+FIELD_ALIASES = {
+    "项目编码": ["项目编码", "编码", "code", "项目编号"],
+    "项目名称": ["项目名称", "名称", "name", "工程名称"],
+    "项目特征": ["项目特征", "特征", "features", "描述", "做法"],
+    "计量单位": ["计量单位", "单位", "unit"],
+    "工程量": ["工程量", "数量", "quantity"],
+    "定额编号": ["定额编号", "定额", "quota"],
+    "备注": ["备注", "备注信息", "remark"]
+}
+
+def normalize_record(rec):
+    """标准化记录键名，如果缺少关键字段尝试推断默认值"""
+    norm = {}
+    # 映射键名
+    alias_map = {}
+    for standard_key, aliases in FIELD_ALIASES.items():
+        for alias in aliases:
+            if alias in rec:
+                alias_map[standard_key] = rec[alias]
+                break
+
+    # 最少需要‘项目特征’或‘项目名称’之一才能生成有效记录
+    if "项目特征" not in alias_map and "项目名称" not in alias_map:
+        return None
+
+    # 填充默认值
+    norm["项目编码"] = alias_map.get("项目编码", "010101001")  # 默认编码
+    norm["项目名称"] = alias_map.get("项目名称", "未命名做法")
+    norm["项目特征"] = alias_map.get("项目特征", "1. 参见构造做法")
+    norm["计量单位"] = alias_map.get("计量单位", "m²")
+    norm["工程量"] = alias_map.get("工程量", "1")
+    norm["备注"] = alias_map.get("备注", "")
+    norm["定额编号"] = alias_map.get("定额编号", "")
+
+    return norm
 
 def process_excel_with_ai(file_path, sheet_name=None):
     df = pd.read_excel(file_path, sheet_name=sheet_name, dtype=str)
@@ -68,21 +104,20 @@ def process_excel_with_ai(file_path, sheet_name=None):
 
     batch_size = 10
     all_bills = []
-    required_keys = ["项目编码", "项目名称", "项目特征", "计量单位", "工程量", "备注", "定额编号"]
+    raw_samples = []  # 收集原始输出样本
 
     for i in range(0, len(all_rows), batch_size):
         batch = all_rows[i:i+batch_size]
         prompt = f"""
-你是工程造价专家。请根据以下做法表，生成GB50500-2013分部分项工程量清单JSON数组。
-
+你是工程造价师。基于以下做法表，生成GB50500-2013分部分项工程量清单JSON数组。
 要求：
-1. 编码严格符合国标，同类做法编码一致，不同部位应区分。
-2. 项目名称体现厚度、材料、强度等级等关键参数，且不可重复。
-3. 项目特征按层次从上到下用数字编号，用 \n 换行。
-4. 单位合理(m²/m³/m/t/个)。
-5. 默认混凝土为商品混凝土，砂浆为干混砂浆。
-6. 匹配四川2020定额编号（如无完全对应可留空字符串）。
-7. 输出纯JSON数组，不要任何解释文字。
+1. 编码符合国标，同类同码。
+2. 名称含厚度、材料等。
+3. 项目特征按层次编号，用 \n 分隔。
+4. 单位 m²/m³/m/t。
+5. 商品混凝土、干混砂浆。
+6. 匹配四川2020定额。
+7. 只输出纯JSON数组。
 
 做法表：
 {json.dumps(batch, ensure_ascii=False, indent=2)}
@@ -90,33 +125,35 @@ def process_excel_with_ai(file_path, sheet_name=None):
         resp = client.chat.completions.create(
             model="deepseek-chat",
             messages=[{"role":"user","content":prompt}],
-            temperature=0.1,
+            temperature=0.0,  # 降低温度，更确定
             max_tokens=4000
         )
         text = resp.choices[0].message.content
+        raw_samples.append(text[:500])  # 保存前500字符用于诊断
 
-        # 尝试提取JSON数组
         records = extract_json_array(text)
 
         if records is None:
-            # 如果完全无法提取，保存原始文本供查看
-            st.warning(f"⚠️ 第{i//batch_size+1}批返回格式无法解析，已跳过。")
-            with st.expander("👉 查看该批次 AI 原始回复"):
-                st.code(text[:2000])  # 只显示前2000字
+            st.warning(f"⚠️ 第{i//batch_size+1}批返回不是有效JSON数组，已跳过。")
             continue
 
-        # 验证每条记录
-        valid_records = []
-        for idx, rec in enumerate(records):
-            missing = [k for k in required_keys if k not in rec]
-            if missing:
-                st.warning(f"⚠️ 第{i//batch_size+1}批第{idx+1}条记录缺少字段：{', '.join(missing)}，已跳过。")
+        batch_valid = 0
+        for rec in records:
+            norm_rec = normalize_record(rec)
+            if norm_rec:
+                all_bills.append(norm_rec)
+                batch_valid += 1
             else:
-                valid_records.append(rec)
+                st.warning(f"⚠️ 跳过一条无效记录（缺少关键字段）")
 
-        all_bills.extend(valid_records)
-        st.write(f"✅ 第{i//batch_size+1}批：生成 {len(valid_records)} 条有效清单")
+        st.write(f"✅ 第{i//batch_size+1}批：生成 {batch_valid} 条清单")
 
+    # 如果没有生成任何清单，展示原始数据供分析
+    if not all_bills:
+        st.error("❌ 全部批次均未生成有效清单。下面是 AI 返回的原始数据样本：")
+        for idx, sample in enumerate(raw_samples):
+            with st.expander(f"第 {idx+1} 批 AI 原始回复 (前500字)"):
+                st.code(sample)
     return all_bills
 
 def write_csv(bills, path):
@@ -142,7 +179,7 @@ if uploaded_file:
             tmp_path = tmp.name
 
         try:
-            with st.spinner("🤖 AI正在处理中，请稍候... 通常需要15-30秒"):
+            with st.spinner("🤖 AI正在处理中... 正在提取清单项"):
                 bills = process_excel_with_ai(tmp_path, sheet)
             os.unlink(tmp_path)
 
@@ -159,6 +196,6 @@ if uploaded_file:
                 os.unlink(out_path)
                 st.download_button("⬇️ 下载清单CSV", data=csv_data.encode("utf-8-sig"), file_name="工程清单.csv")
             else:
-                st.warning("⚠️ 没有生成任何有效清单。请尝试缩小表格、检查‘构造做法’列是否完整。")
+                st.warning("⚠️ 没有生成任何有效清单。请检查‘构造做法’列是否完整，并展开上方AI原始回复信息分析原因。")
         except Exception as e:
             st.error(f"❌ 运行出错：{str(e)}")
