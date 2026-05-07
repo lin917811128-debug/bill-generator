@@ -7,7 +7,41 @@ import re
 from openai import OpenAI
 from pathlib import Path
 
-# ────────────── AI引擎（内置） ──────────────
+# ────────────── AI引擎 ──────────────
+def extract_json_array(text: str):
+    """尝试从AI返回的文本中提取JSON数组，支持多种格式"""
+    # 1. 直接解析整个文本
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            return data
+    except:
+        pass
+
+    # 2. 提取代码块中的json
+    match = re.search(r'```json\s*\n?(.*?)\n?```', text, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group(1))
+            if isinstance(data, list):
+                return data
+        except:
+            pass
+
+    # 3. 提取第一个方括号开始到最后一个方括号结束的内容
+    start = text.find('[')
+    end = text.rfind(']')
+    if start != -1 and end != -1 and end > start:
+        try:
+            data = json.loads(text[start:end+1])
+            if isinstance(data, list):
+                return data
+        except:
+            pass
+
+    # 如果都失败，返回None
+    return None
+
 def process_excel_with_ai(file_path, sheet_name=None):
     df = pd.read_excel(file_path, sheet_name=sheet_name, dtype=str)
     all_rows = []
@@ -32,23 +66,23 @@ def process_excel_with_ai(file_path, sheet_name=None):
         base_url="https://api.deepseek.com"
     )
 
-    batch_size = 10  # 适当减小批次，提高稳定性
+    batch_size = 10
     all_bills = []
     required_keys = ["项目编码", "项目名称", "项目特征", "计量单位", "工程量", "备注", "定额编号"]
 
     for i in range(0, len(all_rows), batch_size):
         batch = all_rows[i:i+batch_size]
         prompt = f"""
-你是工程造价专家。根据以下做法表生成GB50500-2013分部分项工程量清单JSON。
+你是工程造价专家。请根据以下做法表，生成GB50500-2013分部分项工程量清单JSON数组。
 
 要求：
-1. 编码严格符合国标，同做法编码一致，不同部位区分。
-2. 名称体现厚度、材料、强度等关键参数，不可重复。
-3. 项目特征按层次从上到下编号列出，每一条用"\\n"换行。
-4. 单位合理确定(m²/m³/m/t/个等)。
-5. 涉及混凝土默认商品混凝土，砂浆默认干混砂浆。
-6. 匹配四川2020定额编号。
-7. 输出纯JSON数组，不要加任何解释文字。
+1. 编码严格符合国标，同类做法编码一致，不同部位应区分。
+2. 项目名称体现厚度、材料、强度等级等关键参数，且不可重复。
+3. 项目特征按层次从上到下用数字编号，用 \n 换行。
+4. 单位合理(m²/m³/m/t/个)。
+5. 默认混凝土为商品混凝土，砂浆为干混砂浆。
+6. 匹配四川2020定额编号（如无完全对应可留空字符串）。
+7. 输出纯JSON数组，不要任何解释文字。
 
 做法表：
 {json.dumps(batch, ensure_ascii=False, indent=2)}
@@ -61,26 +95,27 @@ def process_excel_with_ai(file_path, sheet_name=None):
         )
         text = resp.choices[0].message.content
 
-        try:
-            # 清理可能的 markdown 标记
-            clean_text = re.sub(r'```json|```', '', text).strip()
-            records = json.loads(clean_text)
+        # 尝试提取JSON数组
+        records = extract_json_array(text)
 
-            # 验证每条记录是否包含所有必要字段
-            valid_records = []
-            for rec in records:
-                if all(key in rec for key in required_keys):
-                    valid_records.append(rec)
-                else:
-                    st.warning(f"⚠️ AI 生成了一条不完整的记录，已自动跳过：{rec.get('项目名称', '未知')}")
+        if records is None:
+            # 如果完全无法提取，保存原始文本供查看
+            st.warning(f"⚠️ 第{i//batch_size+1}批返回格式无法解析，已跳过。")
+            with st.expander("👉 查看该批次 AI 原始回复"):
+                st.code(text[:2000])  # 只显示前2000字
+            continue
 
-            all_bills.extend(valid_records)
-            st.write(f"✅ 本批次成功生成 {len(valid_records)} 条记录")
+        # 验证每条记录
+        valid_records = []
+        for idx, rec in enumerate(records):
+            missing = [k for k in required_keys if k not in rec]
+            if missing:
+                st.warning(f"⚠️ 第{i//batch_size+1}批第{idx+1}条记录缺少字段：{', '.join(missing)}，已跳过。")
+            else:
+                valid_records.append(rec)
 
-        except json.JSONDecodeError as e:
-            st.error(f"❌ AI 返回的数据格式有误，本批次跳过。AI 原始输出：\n```\n{text}\n```")
-        except Exception as e:
-            st.error(f"❌ 处理 AI 返回数据时出错：{str(e)}")
+        all_bills.extend(valid_records)
+        st.write(f"✅ 第{i//batch_size+1}批：生成 {len(valid_records)} 条有效清单")
 
     return all_bills
 
@@ -124,7 +159,6 @@ if uploaded_file:
                 os.unlink(out_path)
                 st.download_button("⬇️ 下载清单CSV", data=csv_data.encode("utf-8-sig"), file_name="工程清单.csv")
             else:
-                st.warning("⚠️ 没有生成任何有效清单。请检查表格中是否有完整的'构造做法'列，或联系管理员。")
+                st.warning("⚠️ 没有生成任何有效清单。请尝试缩小表格、检查‘构造做法’列是否完整。")
         except Exception as e:
             st.error(f"❌ 运行出错：{str(e)}")
-            st.error("如问题持续出现，请截图本页面并联系开发者。")
