@@ -7,7 +7,7 @@ import re
 from openai import OpenAI
 from pathlib import Path
 
-# ────────────── AI引擎（直接内置，避免循环导入）──────────────
+# ────────────── AI引擎（内置） ──────────────
 def process_excel_with_ai(file_path, sheet_name=None):
     df = pd.read_excel(file_path, sheet_name=sheet_name, dtype=str)
     all_rows = []
@@ -32,8 +32,10 @@ def process_excel_with_ai(file_path, sheet_name=None):
         base_url="https://api.deepseek.com"
     )
 
-    batch_size = 15
+    batch_size = 10  # 适当减小批次，提高稳定性
     all_bills = []
+    required_keys = ["项目编码", "项目名称", "项目特征", "计量单位", "工程量", "备注", "定额编号"]
+
     for i in range(0, len(all_rows), batch_size):
         batch = all_rows[i:i+batch_size]
         prompt = f"""
@@ -42,11 +44,11 @@ def process_excel_with_ai(file_path, sheet_name=None):
 要求：
 1. 编码严格符合国标，同做法编码一致，不同部位区分。
 2. 名称体现厚度、材料、强度等关键参数，不可重复。
-3. 特征按层次从上到下编号列出。
+3. 项目特征按层次从上到下编号列出，每一条用"\\n"换行。
 4. 单位合理确定(m²/m³/m/t/个等)。
 5. 涉及混凝土默认商品混凝土，砂浆默认干混砂浆。
 6. 匹配四川2020定额编号。
-7. 输出纯JSON数组，勿加解释。
+7. 输出纯JSON数组，不要加任何解释文字。
 
 做法表：
 {json.dumps(batch, ensure_ascii=False, indent=2)}
@@ -58,11 +60,28 @@ def process_excel_with_ai(file_path, sheet_name=None):
             max_tokens=4000
         )
         text = resp.choices[0].message.content
+
         try:
-            bills = json.loads(re.sub(r'```json|```', '', text).strip())
-            all_bills.extend(bills)
-        except:
-            pass
+            # 清理可能的 markdown 标记
+            clean_text = re.sub(r'```json|```', '', text).strip()
+            records = json.loads(clean_text)
+
+            # 验证每条记录是否包含所有必要字段
+            valid_records = []
+            for rec in records:
+                if all(key in rec for key in required_keys):
+                    valid_records.append(rec)
+                else:
+                    st.warning(f"⚠️ AI 生成了一条不完整的记录，已自动跳过：{rec.get('项目名称', '未知')}")
+
+            all_bills.extend(valid_records)
+            st.write(f"✅ 本批次成功生成 {len(valid_records)} 条记录")
+
+        except json.JSONDecodeError as e:
+            st.error(f"❌ AI 返回的数据格式有误，本批次跳过。AI 原始输出：\n```\n{text}\n```")
+        except Exception as e:
+            st.error(f"❌ 处理 AI 返回数据时出错：{str(e)}")
+
     return all_bills
 
 def write_csv(bills, path):
@@ -78,7 +97,7 @@ st.title("🏗️ 智能分部分项清单生成工具")
 st.markdown("上传构造做法表，AI自动生成符合GB 50500规范的清单（含四川2020定额）")
 
 uploaded_file = st.file_uploader("📁 选择Excel文件", type=["xls","xlsx"])
-sheet = st.text_input("工作表名", "Sheet1")
+sheet = st.text_input("📋 工作表名", "Sheet1")
 
 if uploaded_file:
     st.info("📌 文件已上传，请点击下方按钮开始生成")
@@ -88,12 +107,12 @@ if uploaded_file:
             tmp_path = tmp.name
 
         try:
-            with st.spinner("🤖 AI正在处理中，请稍候..."):
+            with st.spinner("🤖 AI正在处理中，请稍候... 通常需要15-30秒"):
                 bills = process_excel_with_ai(tmp_path, sheet)
             os.unlink(tmp_path)
 
             if bills:
-                st.success(f"✅ 成功生成 {len(bills)} 条清单")
+                st.success(f"🎉 成功生成 {len(bills)} 条清单")
                 df_view = pd.DataFrame(bills)
                 df_view["项目特征"] = df_view["项目特征"].str.replace("\n", " | ")
                 st.dataframe(df_view[["项目编码","项目名称","项目特征","计量单位","工程量","备注","定额编号"]], use_container_width=True)
@@ -105,6 +124,7 @@ if uploaded_file:
                 os.unlink(out_path)
                 st.download_button("⬇️ 下载清单CSV", data=csv_data.encode("utf-8-sig"), file_name="工程清单.csv")
             else:
-                st.warning("⚠️ AI暂未识别出有效做法，请确认表格格式。")
+                st.warning("⚠️ 没有生成任何有效清单。请检查表格中是否有完整的'构造做法'列，或联系管理员。")
         except Exception as e:
             st.error(f"❌ 运行出错：{str(e)}")
+            st.error("如问题持续出现，请截图本页面并联系开发者。")
